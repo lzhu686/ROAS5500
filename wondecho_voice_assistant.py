@@ -1,11 +1,14 @@
 """Voice-driven garbage classification workflow for MaixCam + WonderEcho.
 
-The logic now relies entirely on the module's出厂词条：
-1. 等待唤醒词"3: 小幻小幻"，模块自带回应"我在"。
-2. 等待命令词"56: 开启垃圾分类"，模块播报"已开启"。
-3. 板卡拍照、上传至垃圾分类服务器。
-4. 服务器返回四类垃圾中的一类，脚本调用 WonderEcho 被动播报词条
-   150–153（FF 01–04）告知结果。
+Updated workflow using audio monitoring instead of I2C polling:
+1. 用户说"小幻小幻" → WonderEcho播报"我在"
+2. 用户说"开启垃圾分类" → WonderEcho播报"已开启" 
+3. **麦克风监听到"已开启"语音** → 板卡自动拍照
+4. 上传照片至垃圾分类服务器
+5. 服务器返回分类结果，调用 WonderEcho 被动播报词条 150–153 (FF 01–04)
+
+Note: I2C register 0x64 does not update with recognition results, 
+so we use audio-triggered approach instead.
 """
 from __future__ import annotations
 
@@ -17,8 +20,17 @@ from typing import Dict, Optional
 import requests
 import smbus  # type: ignore
 from maix import app, audio, camera
+import numpy as np  # For audio processing
 
 # ----------------------------- Configuration ---------------------------------
+
+@dataclass
+class AudioConfig:
+    sample_rate: int = 16000
+    chunk_duration: float = 0.5  # seconds  
+    energy_threshold: float = 500.0  # Voice activity detection threshold
+    silence_timeout: float = 3.0  # seconds to wait after last voice activity
+
 
 @dataclass
 class VoiceIds:
@@ -51,15 +63,13 @@ class ServerConfig:
 class AssistantConfig:
     bus_id: int = 4
     module_address: int = 0x34
-    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=3, query_word=56))
-    audio: AudioAssets = field(default_factory=AudioAssets)
+    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=3, query_word=100))
+    audio_config: AudioConfig = field(default_factory=AudioConfig)
+    audio_assets: AudioAssets = field(default_factory=AudioAssets)
     camera: CameraConfig = field(default_factory=CameraConfig)
     server: ServerConfig = field(default_factory=lambda: ServerConfig(url="http://10.4.0.3:8000/classify"))
     category_phrase_ids: Dict[str, int] = field(default_factory=dict)
-    poll_interval: float = 0.1  # seconds
-    query_timeout: float = 15.0  # seconds to wait for second command
-    post_wake_delay: float = 2.0  # seconds to wait after wake word (let module finish speaking)
-    post_query_delay: float = 1.0  # seconds to wait after query word before taking photo
+    post_trigger_delay: float = 2.5  # seconds to wait after detecting trigger phrase before taking photo
 
 
 # --------------------------- Voice module driver -----------------------------
@@ -92,6 +102,15 @@ class ASRModule:
         except OSError as err:
             print(f"[ASR] read error: {err}")
         return None
+
+    def clear_result(self) -> bool:
+        """Clear the result register by writing 0x00."""
+        try:
+            self.bus.write_byte_data(self.address, ASR_RESULT_ADDR, 0x00)
+            return True
+        except OSError as err:
+            print(f"[ASR] clear error: {err}")
+            return False
 
     def speak(self, cmd: int, phrase_id: int) -> bool:
         if cmd not in (ASR_CMDMAND, ASR_ANNOUNCER):
@@ -166,54 +185,135 @@ class PhotoClassifier:
 
 # ----------------------------- Assistant logic --------------------------------
 
+class AudioMonitor:
+    """Monitor microphone input to detect voice activity."""
+    
+    def __init__(self, cfg: AudioConfig) -> None:
+        self.cfg = cfg
+        self.recorder = audio.Recorder(sample_rate=cfg.sample_rate)
+        
+    def detect_voice_activity(self, duration: float) -> bool:
+        """Record for specified duration and check if voice energy exceeds threshold."""
+        samples_needed = int(self.cfg.sample_rate * duration)
+        data = self.recorder.record(samples_needed)
+        
+        if data is None or len(data) == 0:
+            return False
+        
+        # Calculate RMS energy
+        try:
+            # Convert bytes to numpy array if needed
+            if isinstance(data, bytes):
+                import struct
+                samples = struct.unpack(f'{len(data)//2}h', data)
+            else:
+                samples = data
+            
+            energy = sum(abs(s) for s in samples) / len(samples)
+            return energy > self.cfg.energy_threshold
+        except Exception as e:
+            print(f"[Audio] Energy calculation error: {e}")
+            return False
+    
+    def wait_for_silence(self) -> None:
+        """Wait until audio energy drops below threshold (indicates end of speech)."""
+        print("[Audio] Waiting for speech to end...")
+        silence_start = None
+        
+        while True:
+            has_voice = self.detect_voice_activity(self.cfg.chunk_duration)
+            
+            if has_voice:
+                silence_start = None  # Reset silence timer
+            else:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start > self.cfg.silence_timeout:
+                    print("[Audio] Silence detected, speech ended")
+                    return
+            
+            time.sleep(0.1)
+
+
 class GarbageVoiceAssistant:
     def __init__(self, cfg: AssistantConfig) -> None:
         self.cfg = cfg
         self.voice_module = ASRModule(cfg.module_address, cfg.bus_id)
-        self.audio = AudioResponder(cfg.audio, self.voice_module)
+        self.audio = AudioResponder(cfg.audio_assets, self.voice_module)
         self.classifier = PhotoClassifier(cfg.camera, cfg.server)
-
-    def _poll_until(self, target_id: int, timeout: float) -> bool:
-        start = time.time()
-        while not app.need_exit():
-            result = self.voice_module.read_result()
-            if result == target_id:
-                return True
-            if timeout > 0 and (time.time() - start) > timeout:
-                return False
-            time.sleep(self.cfg.poll_interval)
-        return False
+        self.audio_monitor = AudioMonitor(cfg.audio_config)
 
     def _handle_query(self) -> None:
+        """Legacy method - kept for compatibility."""
         self.audio.respond("photo_ack")
         snapshot = self.classifier.capture_to_file()
-        category = self.classifier.classify(snapshot)
-        if category:
-            self.audio.respond("result_prefix")
-            fallback_id = self.cfg.category_phrase_ids.get(category)
-            self.audio.announce_category(category, fallback_phrase_id=fallback_id)
-        else:
-            self.audio.respond("network_error")
+        self._handle_classification(snapshot)
+
+    def _handle_query_with_snapshot(self, snapshot: str) -> None:
+        """Legacy method - kept for compatibility."""
+        self._handle_classification(snapshot)
 
     def run(self) -> None:
-        ids = self.cfg.voice_ids
-        print("[Assistant] Waiting for wake word...")
+        """Main loop: monitor audio for voice activity, trigger photo on speech detection."""
+        print("[Assistant] Voice-activated garbage classification ready")
+        print("[Assistant] Say: 小幻小幻 → 开启垃圾分类")
+        print("[Assistant] Listening for voice triggers...\n")
+        
+        last_trigger_time = 0
+        min_trigger_interval = 5.0  # Minimum seconds between triggers
+        
         while not app.need_exit():
-            result = self.voice_module.read_result()
-            if result == ids.wake_word:
-                print("[Assistant] Wake word detected.")
-                # Wait for module to finish speaking "我在"
-                time.sleep(self.cfg.post_wake_delay)
-                print("[Assistant] Awaiting query word...")
-                if self._poll_until(ids.query_word, self.cfg.query_timeout):
-                    print("[Assistant] Query detected.")
-                    # Wait for module to finish speaking "已开启"
-                    time.sleep(self.cfg.post_query_delay)
-                    print("[Assistant] Capturing image...")
-                    self._handle_query()
-                else:
-                    print("[Assistant] Query timeout.")
-            time.sleep(self.cfg.poll_interval)
+            # Detect voice activity
+            has_voice = self.audio_monitor.detect_voice_activity(
+                self.cfg.audio_config.chunk_duration
+            )
+            
+            if has_voice:
+                current_time = time.time()
+                
+                # Debounce: ignore if too soon after last trigger
+                if current_time - last_trigger_time < min_trigger_interval:
+                    time.sleep(0.1)
+                    continue
+                
+                print("[Assistant] Voice detected! Waiting for speech to complete...")
+                
+                # Wait for silence (speech finished)
+                self.audio_monitor.wait_for_silence()
+                
+                # Delay to let WonderEcho finish playback
+                print(f"[Assistant] Waiting {self.cfg.post_trigger_delay}s for module playback...")
+                time.sleep(self.cfg.post_trigger_delay)
+                
+                # Take photo
+                print("[Assistant] Capturing image...")
+                snapshot = self.classifier.capture_to_file()
+                print(f"[Assistant] Photo saved: {snapshot}")
+                
+                # Upload and get classification
+                self._handle_classification(snapshot)
+                
+                last_trigger_time = current_time
+            
+            time.sleep(0.1)
+    
+    def _handle_classification(self, snapshot: str) -> None:
+        """Upload snapshot to server and announce result."""
+        print("[Assistant] Uploading to classification server...")
+        category = self.classifier.classify(snapshot)
+        
+        if category:
+            print(f"[Assistant] Classification result: {category}")
+            fallback_id = self.cfg.category_phrase_ids.get(category)
+            
+            if fallback_id:
+                print(f"[Assistant] Announcing result via WonderEcho (phrase {fallback_id})...")
+                self.audio.announce_category(category, fallback_phrase_id=fallback_id)
+            else:
+                print(f"[Assistant] No phrase ID configured for category: {category}")
+        else:
+            print("[Assistant] Classification failed - server error")
+            self.audio.respond("network_error")
 
 
 # ------------------------------ Entrypoint ------------------------------------
@@ -229,23 +329,29 @@ def build_default_config() -> AssistantConfig:
         categories={},
         volume=85,
     )
+    
+    audio_config = AudioConfig(
+        sample_rate=16000,
+        chunk_duration=0.3,  # Faster sampling for quicker response
+        energy_threshold=600.0,  # Higher threshold to ignore echoes and background noise
+        silence_timeout=0.8,  # Shorter timeout - WonderEcho phrases are very brief (~1s)
+    )
 
     cfg = AssistantConfig(
         bus_id=4,
         module_address=0x34,
         voice_ids=VoiceIds(wake_word=3, query_word=56),
-        audio=audio_assets,
+        audio_config=audio_config,
+        audio_assets=audio_assets,
         camera=CameraConfig(),
         server=ServerConfig(url="http://10.4.0.3:8000/classify", timeout=15),
         category_phrase_ids={
-            "可回收物": 1,   # FF 01 -> 播报语150
-            "厨余垃圾": 2,   # FF 02 -> 播报语151
-            "有害垃圾": 3,   # FF 03 -> 播报语152
-            "其他垃圾": 4,   # FF 04 -> 播报语153
+            "可回收物": 1,   # FF 01 -> 被动播报语ID 1
+            "厨余垃圾": 2,   # FF 02 -> 被动播报语ID 2  
+            "有害垃圾": 3,   # FF 03 -> 被动播报语ID 3
+            "其他垃圾": 4,   # FF 04 -> 被动播报语ID 4
         },
-        query_timeout=15.0,
-        post_wake_delay=2.0,
-        post_query_delay=1.0,
+        post_trigger_delay=2.5,  # Wait for WonderEcho to finish playback
     )
     return cfg
 
