@@ -265,19 +265,21 @@ class GarbageVoiceAssistant:
         self._handle_classification(snapshot)
 
     def run(self) -> None:
-        """Main loop: optimized for fast response.
+        """Main loop: voice-triggered garbage classification.
         
         Workflow:
-        1. Detect voice → immediately capture photo (parallel with WonderEcho playback)
-        2. Upload to server while WonderEcho is still playing "已开启"
-        3. Announce result as soon as server responds
+        1. Detect voice activity (user speaking to WonderEcho)
+        2. Wait for user to finish speaking
+        3. Wait for WonderEcho to finish responding (e.g. "已开启")
+        4. Capture photo and upload to server
+        5. Wait briefly, then announce classification result
         """
         print("[Assistant] Voice-activated garbage classification ready")
         print("[Assistant] Say: 小幻小幻 → 开启垃圾分类")
         print("[Assistant] Listening for voice triggers...\n")
         
         last_trigger_time = 0
-        min_trigger_interval = 6.0  # Reduced - faster response cycle
+        min_trigger_interval = 8.0  # Minimum time between triggers (full workflow)
         
         while not app.need_exit():
             # Detect voice activity
@@ -293,21 +295,26 @@ class GarbageVoiceAssistant:
                     time.sleep(0.1)
                     continue
                 
-                print("[Assistant] Voice detected!")
+                print("[Assistant] Voice detected! Waiting for speech to end...")
                 
-                # IMMEDIATELY capture photo (don't wait for silence or WonderEcho)
-                # This runs in parallel with WonderEcho saying "已开启"
-                print("[Assistant] Capturing image immediately...")
+                # Wait for user + WonderEcho to finish speaking
+                self.audio_monitor.wait_for_silence()
+                
+                # Additional delay to ensure WonderEcho finished "已开启" playback
+                print("[Assistant] Waiting for WonderEcho response to complete...")
+                time.sleep(1.5)
+                
+                # Now capture photo
+                print("[Assistant] Capturing image...")
                 snapshot = self.classifier.capture_to_file()
                 print(f"[Assistant] Photo captured: {snapshot}")
                 
-                # Upload to server (WonderEcho may still be playing)
+                # Upload to server and get result
                 self._handle_classification(snapshot)
                 
-                last_trigger_time = current_time
-                
-                # Brief pause before listening again
-                time.sleep(1.0)
+                last_trigger_time = time.time()  # Update after full workflow
+            
+            time.sleep(0.1)
             
             time.sleep(0.1)
     
@@ -321,8 +328,16 @@ class GarbageVoiceAssistant:
             fallback_id = self.cfg.category_phrase_ids.get(category)
             
             if fallback_id:
+                # Brief delay to ensure WonderEcho is ready for new command
+                print("[Assistant] Preparing to announce result...")
+                time.sleep(0.5)
+                
                 # Send I2C command to WonderEcho
-                self.audio.announce_category(category, fallback_phrase_id=fallback_id)
+                success = self.audio.announce_category(category, fallback_phrase_id=fallback_id)
+                
+                if success:
+                    # Wait for announcement to complete before next trigger
+                    time.sleep(2.0)
             else:
                 print(f"[Assistant] ERROR: No phrase ID for category: {category}")
                 print(f"[Assistant] Available categories: {list(self.cfg.category_phrase_ids.keys())}")
