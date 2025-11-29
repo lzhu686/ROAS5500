@@ -141,13 +141,24 @@ class AudioResponder:
         if not played and fallback_phrase_id is not None and self.voice:
             self.voice.speak(ASR_CMDMAND, fallback_phrase_id)
 
-    def announce_category(self, category: str, fallback_phrase_id: Optional[int] = None) -> None:
+    def announce_category(self, category: str, fallback_phrase_id: Optional[int] = None) -> bool:
+        """Announce garbage category via WAV or WonderEcho I2C.
+        
+        Returns True if announcement was sent successfully.
+        """
         wav_path = self.assets.categories.get(category)
         if wav_path and self._play_wav(wav_path):
-            return
-        print(f"[Audio] No WAV for category '{category}', fallback to TTS/ASR.")
+            return True
+        # Use WonderEcho I2C speak command
         if fallback_phrase_id is not None and self.voice:
-            self.voice.speak(ASR_ANNOUNCER, fallback_phrase_id)
+            print(f"[Audio] Sending I2C speak command: 0xFF 0x{fallback_phrase_id:02X} for '{category}'")
+            success = self.voice.speak(ASR_ANNOUNCER, fallback_phrase_id)
+            if success:
+                print(f"[Audio] ✓ WonderEcho will announce: {category}")
+            else:
+                print(f"[Audio] ✗ I2C speak command failed!")
+            return success
+        return False
 
 
 # ------------------------------ Camera + HTTP --------------------------------
@@ -254,13 +265,19 @@ class GarbageVoiceAssistant:
         self._handle_classification(snapshot)
 
     def run(self) -> None:
-        """Main loop: monitor audio for voice activity, trigger photo on speech detection."""
+        """Main loop: optimized for fast response.
+        
+        Workflow:
+        1. Detect voice → immediately capture photo (parallel with WonderEcho playback)
+        2. Upload to server while WonderEcho is still playing "已开启"
+        3. Announce result as soon as server responds
+        """
         print("[Assistant] Voice-activated garbage classification ready")
         print("[Assistant] Say: 小幻小幻 → 开启垃圾分类")
         print("[Assistant] Listening for voice triggers...\n")
         
         last_trigger_time = 0
-        min_trigger_interval = 5.0  # Minimum seconds between triggers
+        min_trigger_interval = 6.0  # Reduced - faster response cycle
         
         while not app.need_exit():
             # Detect voice activity
@@ -276,44 +293,41 @@ class GarbageVoiceAssistant:
                     time.sleep(0.1)
                     continue
                 
-                print("[Assistant] Voice detected! Waiting for speech to complete...")
+                print("[Assistant] Voice detected!")
                 
-                # Wait for silence (speech finished)
-                self.audio_monitor.wait_for_silence()
-                
-                # Delay to let WonderEcho finish playback
-                print(f"[Assistant] Waiting {self.cfg.post_trigger_delay}s for module playback...")
-                time.sleep(self.cfg.post_trigger_delay)
-                
-                # Take photo
-                print("[Assistant] Capturing image...")
+                # IMMEDIATELY capture photo (don't wait for silence or WonderEcho)
+                # This runs in parallel with WonderEcho saying "已开启"
+                print("[Assistant] Capturing image immediately...")
                 snapshot = self.classifier.capture_to_file()
-                print(f"[Assistant] Photo saved: {snapshot}")
+                print(f"[Assistant] Photo captured: {snapshot}")
                 
-                # Upload and get classification
+                # Upload to server (WonderEcho may still be playing)
                 self._handle_classification(snapshot)
                 
                 last_trigger_time = current_time
+                
+                # Brief pause before listening again
+                time.sleep(1.0)
             
             time.sleep(0.1)
     
     def _handle_classification(self, snapshot: str) -> None:
         """Upload snapshot to server and announce result."""
-        print("[Assistant] Uploading to classification server...")
+        print("[Assistant] Uploading to server...")
         category = self.classifier.classify(snapshot)
         
         if category:
-            print(f"[Assistant] Classification result: {category}")
+            print(f"[Assistant] Result: {category}")
             fallback_id = self.cfg.category_phrase_ids.get(category)
             
             if fallback_id:
-                print(f"[Assistant] Announcing result via WonderEcho (phrase {fallback_id})...")
+                # Send I2C command to WonderEcho
                 self.audio.announce_category(category, fallback_phrase_id=fallback_id)
             else:
-                print(f"[Assistant] No phrase ID configured for category: {category}")
+                print(f"[Assistant] ERROR: No phrase ID for category: {category}")
+                print(f"[Assistant] Available categories: {list(self.cfg.category_phrase_ids.keys())}")
         else:
             print("[Assistant] Classification failed - server error")
-            self.audio.respond("network_error")
 
 
 # ------------------------------ Entrypoint ------------------------------------
@@ -332,9 +346,9 @@ def build_default_config() -> AssistantConfig:
     
     audio_config = AudioConfig(
         sample_rate=16000,
-        chunk_duration=0.3,  # Faster sampling for quicker response
-        energy_threshold=600.0,  # Higher threshold to ignore echoes and background noise
-        silence_timeout=0.8,  # Shorter timeout - WonderEcho phrases are very brief (~1s)
+        chunk_duration=0.25,  # Very fast sampling (250ms) for quick response
+        energy_threshold=700.0,  # Higher threshold - only detect clear speech
+        silence_timeout=0.6,  # Minimal timeout - WonderEcho phrases are ~1s total
     )
 
     cfg = AssistantConfig(
@@ -346,12 +360,12 @@ def build_default_config() -> AssistantConfig:
         camera=CameraConfig(),
         server=ServerConfig(url="http://10.4.0.3:8000/classify", timeout=15),
         category_phrase_ids={
-            "可回收物": 1,   # FF 01 -> 被动播报语ID 1
-            "厨余垃圾": 2,   # FF 02 -> 被动播报语ID 2  
-            "有害垃圾": 3,   # FF 03 -> 被动播报语ID 3
-            "其他垃圾": 4,   # FF 04 -> 被动播报语ID 4
+            "可回收物": 1,   # FF 01 -> 播报语150 "可回收物"
+            "厨余垃圾": 2,   # FF 02 -> 播报语151 "厨余垃圾"
+            "有害垃圾": 3,   # FF 03 -> 播报语152 "有害垃圾"
+            "其他垃圾": 4,   # FF 04 -> 播报语153 "其他垃圾"
         },
-        post_trigger_delay=2.5,  # Wait for WonderEcho to finish playback
+        post_trigger_delay=1.5,  # Reduced from 2.5s - faster photo trigger
     )
     return cfg
 
