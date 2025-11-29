@@ -1,11 +1,11 @@
 """Voice-driven garbage classification workflow for MaixCam + WonderEcho.
 
 The logic now relies entirely on the module's出厂词条：
-1. 等待唤醒词“3: 小幻小幻”，模块自带回应“我在”。
-2. 等待命令词“36: 开启垃圾分类”，模块播报“开启垃圾分类”。
-3. 板卡提示拍照、取图上传至垃圾分类服务器。
+1. 等待唤醒词"3: 小幻小幻"，模块自带回应"我在"。
+2. 等待命令词"56: 开启垃圾分类"，模块播报"已开启"。
+3. 板卡拍照、上传至垃圾分类服务器。
 4. 服务器返回四类垃圾中的一类，脚本调用 WonderEcho 被动播报词条
-    43–46 告知结果（若配置了自录 WAV，则先播放 WAV）。
+   150–153（FF 01–04）告知结果。
 """
 from __future__ import annotations
 
@@ -51,13 +51,15 @@ class ServerConfig:
 class AssistantConfig:
     bus_id: int = 4
     module_address: int = 0x34
-    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=1, query_word=2))
+    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=3, query_word=56))
     audio: AudioAssets = field(default_factory=AudioAssets)
     camera: CameraConfig = field(default_factory=CameraConfig)
     server: ServerConfig = field(default_factory=lambda: ServerConfig(url="http://10.4.0.3:8000/classify"))
     category_phrase_ids: Dict[str, int] = field(default_factory=dict)
     poll_interval: float = 0.1  # seconds
-    query_timeout: float = 8.0  # seconds to wait for second command
+    query_timeout: float = 15.0  # seconds to wait for second command
+    post_wake_delay: float = 2.0  # seconds to wait after wake word (let module finish speaking)
+    post_query_delay: float = 1.0  # seconds to wait after query word before taking photo
 
 
 # --------------------------- Voice module driver -----------------------------
@@ -200,10 +202,14 @@ class GarbageVoiceAssistant:
             result = self.voice_module.read_result()
             if result == ids.wake_word:
                 print("[Assistant] Wake word detected.")
-                self.audio.respond("wake_ack")
+                # Wait for module to finish speaking "我在"
+                time.sleep(self.cfg.post_wake_delay)
                 print("[Assistant] Awaiting query word...")
                 if self._poll_until(ids.query_word, self.cfg.query_timeout):
-                    print("[Assistant] Query detected, capturing image.")
+                    print("[Assistant] Query detected.")
+                    # Wait for module to finish speaking "已开启"
+                    time.sleep(self.cfg.post_query_delay)
+                    print("[Assistant] Capturing image...")
                     self._handle_query()
                 else:
                     print("[Assistant] Query timeout.")
@@ -227,17 +233,19 @@ def build_default_config() -> AssistantConfig:
     cfg = AssistantConfig(
         bus_id=4,
         module_address=0x34,
-        voice_ids=VoiceIds(wake_word=3, query_word=36),
+        voice_ids=VoiceIds(wake_word=3, query_word=56),
         audio=audio_assets,
         camera=CameraConfig(),
         server=ServerConfig(url="http://10.4.0.3:8000/classify", timeout=15),
         category_phrase_ids={
-            "可回收物": 43,
-            "厨余垃圾": 44,
-            "有害垃圾": 45,
-            "其他垃圾": 46,
+            "可回收物": 1,   # FF 01 -> 播报语150
+            "厨余垃圾": 2,   # FF 02 -> 播报语151
+            "有害垃圾": 3,   # FF 03 -> 播报语152
+            "其他垃圾": 4,   # FF 04 -> 播报语153
         },
         query_timeout=15.0,
+        post_wake_delay=2.0,
+        post_query_delay=1.0,
     )
     return cfg
 
