@@ -250,12 +250,14 @@ class PhotoClassifier:
         self.cam_cfg = cam_cfg
         self.server_cfg = server_cfg
         self.cam = camera.Camera(cam_cfg.width, cam_cfg.height)
+        # Pre-warm camera for faster first capture
+        _ = self.cam.read()
 
     def capture_to_file(self) -> str:
         img = self.cam.read()
         snapshot_path = self.cam_cfg.snapshot_path
         os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-        img.save(snapshot_path)
+        img.save(snapshot_path)  # Full quality for best classification accuracy
         return snapshot_path
 
     def classify(self, image_path: str) -> Optional[str]:
@@ -361,7 +363,7 @@ class GarbageVoiceAssistant:
         print("[Assistant] Listening for voice triggers...\n")
         
         last_trigger_time = 0
-        min_trigger_interval = 8.0  # Minimum time between triggers (full workflow)
+        min_trigger_interval = 6.0  # Aggressive mode: reduced interval for faster re-trigger
         
         while not app.need_exit():
             # Detect voice activity
@@ -377,17 +379,10 @@ class GarbageVoiceAssistant:
                     time.sleep(0.1)
                     continue
                 
-                print("[Assistant] Voice detected! Waiting for speech to end...")
+                print("[Assistant] Voice detected! Capturing immediately...")
                 
-                # Wait for user + WonderEcho to finish speaking
-                self.audio_monitor.wait_for_silence()
-                
-                # Additional delay to ensure WonderEcho finished "已开启" playback
-                print("[Assistant] Waiting for WonderEcho response to complete...")
-                time.sleep(1.5)
-                
-                # Now capture photo
-                print("[Assistant] Capturing image...")
+                # AGGRESSIVE MODE: Capture photo immediately without waiting
+                # This triggers as soon as user says "小幻小幻"
                 snapshot = self.classifier.capture_to_file()
                 print(f"[Assistant] Photo captured: {snapshot}")
                 
@@ -414,7 +409,7 @@ class GarbageVoiceAssistant:
             if success:
                 print(f"[Assistant] ✓ Result announced successfully")
                 # 等待音频播放完成
-                time.sleep(2.5)
+                time.sleep(1.5)  # Minimal wait for audio completion
             else:
                 print(f"[Assistant] ✗ Failed to announce result")
         else:
@@ -447,7 +442,7 @@ def build_default_config() -> AssistantConfig:
         sample_rate=16000,
         chunk_duration=0.25,  # Very fast sampling (250ms) for quick response
         energy_threshold=700.0,  # Higher threshold - only detect clear speech
-        silence_timeout=0.6,  # Minimal timeout - WonderEcho phrases are ~1s total
+        silence_timeout=0.3,  # Minimal timeout (not used in aggressive mode)
     )
 
     cfg = AssistantConfig(
@@ -464,7 +459,7 @@ def build_default_config() -> AssistantConfig:
             "有害垃圾": 3,   # FF 03 -> 播报语152 "有害垃圾"
             "其他垃圾": 4,   # FF 04 -> 播报语153 "其他垃圾"
         },
-        post_trigger_delay=1.5,  # Reduced from 2.5s - faster photo trigger
+        post_trigger_delay=0.8,  # Optimized: 1.5→0.8s for faster photo capture
     )
     return cfg
 
