@@ -64,7 +64,7 @@ class ServerConfig:
 class AssistantConfig:
     bus_id: int = 4
     module_address: int = 0x34
-    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=3, query_word=100))
+    voice_ids: VoiceIds = field(default_factory=lambda: VoiceIds(wake_word=3, query_word=56))
     audio_config: AudioConfig = field(default_factory=AudioConfig)
     audio_assets: AudioAssets = field(default_factory=AudioAssets)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -87,21 +87,34 @@ class ASRModule:
         self.bus = smbus.SMBus(bus_id)
         self._send = [0, 0]
 
-    def _write_block(self, reg: int, payload: list[int]) -> bool:
+    def _write_pure_i2c(self, reg: int, cmd: int, phrase_id: int) -> bool:
+        """
+        Send command using Pure I2C protocol (simulated via write_word_data).
+        Target sequence: [Addr] [Reg] [Cmd] [ID]
+        write_word_data sends: [Addr] [Reg] [LowByte] [HighByte]
+        Therefore: LowByte=Cmd, HighByte=ID
+        """
         try:
-            self.bus.write_i2c_block_data(self.address, reg, payload)
+            value = (phrase_id << 8) | cmd
+            self.bus.write_word_data(self.address, reg, value)
             return True
         except OSError as err:
             print(f"[ASR] write error: {err}")
             return False
 
     def read_result(self) -> Optional[int]:
+        """Read recognition result from register 0x64.
+        
+        Returns the recognized command ID, or None if read fails.
+        """
         try:
+            # Revert to block read which was known to work for reading
             data = self.bus.read_i2c_block_data(self.address, ASR_RESULT_ADDR, 1)
-            if data:
+            if data and len(data) > 0:
                 return data[0]
         except OSError as err:
-            print(f"[ASR] read error: {err}")
+            # print(f"[ASR] read error: {err}") 
+            pass
         return None
 
     def clear_result(self) -> bool:
@@ -116,9 +129,7 @@ class ASRModule:
     def speak(self, cmd: int, phrase_id: int) -> bool:
         if cmd not in (ASR_CMDMAND, ASR_ANNOUNCER):
             return False
-        self._send[0] = cmd
-        self._send[1] = phrase_id
-        return self._write_block(ASR_SPEAK_ADDR, self._send)
+        return self._write_pure_i2c(ASR_SPEAK_ADDR, cmd, phrase_id)
 
 
 # ------------------------------ Audio output ---------------------------------
@@ -352,48 +363,64 @@ class GarbageVoiceAssistant:
         """Main loop: voice-triggered garbage classification.
         
         Workflow:
-        1. Detect voice activity (user speaking to WonderEcho)
-        2. Wait for user to finish speaking
-        3. Wait for WonderEcho to finish responding (e.g. "已开启")
-        4. Capture photo and upload to server
-        5. Wait briefly, then announce classification result
+        1. Poll WonderEcho I2C register for command recognition
+        2. When "开启垃圾分类" (ID 56) detected → immediately capture photo
+        3. Upload to server and announce result
         """
         print("[Assistant] Voice-activated garbage classification ready")
-        print("[Assistant] Say: 小幻小幻 → 开启垃圾分类")
-        print("[Assistant] Listening for voice triggers...\n")
+        print(f"[Assistant] Listening for: '开启垃圾分类' (ID={self.cfg.voice_ids.query_word})")
+        print("[Assistant] Polling I2C register 0x64...\n")
         
-        last_trigger_time = 0
-        min_trigger_interval = 6.0  # Aggressive mode: reduced interval for faster re-trigger
+        # Clear any stale recognition results from previous sessions
+        self.voice_module.clear_result()
+        time.sleep(0.3)
+        print("[Assistant] Ready to listen!\n")
+        
+        last_id = 0
         
         while not app.need_exit():
-            # Detect voice activity
-            has_voice = self.audio_monitor.detect_voice_activity(
-                self.cfg.audio_config.chunk_duration
-            )
-            
-            if has_voice:
-                current_time = time.time()
+            try:
+                # Poll I2C result
+                current_id = self.voice_module.read_result()
                 
-                # Debounce: ignore if too soon after last trigger
-                if current_time - last_trigger_time < min_trigger_interval:
+                if current_id and current_id != 0:
+                    if current_id != last_id:
+                        print(f"[Assistant] Detected ID: {current_id}")
+                        
+                        # Check for "开启垃圾分类" (ID 56)
+                        if current_id == self.cfg.voice_ids.query_word:
+                            print(f"[Assistant] Trigger detected! Starting classification...")
+                            
+                            # Optional: Acknowledge via MaixCam Audio (if needed)
+                            # self.audio.respond("wake_ack") 
+                            
+                            # Capture and Classify
+                            snapshot = self.classifier.capture_to_file()
+                            self._handle_classification(snapshot)
+                            
+                            # Clear result to prevent re-triggering immediately
+                            self.voice_module.clear_result()
+                            last_id = 0 # Reset last_id to allow same command again
+                            
+                        elif current_id == self.cfg.voice_ids.wake_word:
+                            print(f"[Assistant] Wake word detected: 小幻小幻 (ID={current_id})")
+                            # Clear result to allow re-triggering of wake word log
+                            self.voice_module.clear_result()
+                            last_id = 0
+                            
+                        else:
+                            print(f"[Assistant] Ignoring ID {current_id}")
+                            last_id = current_id
+                            
+                    # Small delay to prevent CPU hogging
                     time.sleep(0.1)
-                    continue
-                
-                print("[Assistant] Voice detected! Capturing immediately...")
-                
-                # AGGRESSIVE MODE: Capture photo immediately without waiting
-                # This triggers as soon as user says "小幻小幻"
-                snapshot = self.classifier.capture_to_file()
-                print(f"[Assistant] Photo captured: {snapshot}")
-                
-                # Upload to server and get result
-                self._handle_classification(snapshot)
-                
-                last_trigger_time = time.time()  # Update after full workflow
-            
-            time.sleep(0.1)
-            
-            time.sleep(0.1)
+                else:
+                    last_id = 0
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"[Assistant] Loop error: {e}")
+                time.sleep(1.0)
     
     def _handle_classification(self, snapshot: str) -> None:
         """Upload snapshot to server and announce result."""
@@ -448,18 +475,18 @@ def build_default_config() -> AssistantConfig:
     cfg = AssistantConfig(
         bus_id=4,
         module_address=0x34,
-        voice_ids=VoiceIds(wake_word=3, query_word=56),
+        voice_ids=VoiceIds(wake_word=3, query_word=100), # 3=小幻小幻, 100(0x64)=开启垃圾分类
         audio_config=audio_config,
         audio_assets=audio_assets,
         camera=CameraConfig(),
         server=ServerConfig(url="http://10.4.0.3:8000/classify", timeout=15),
         category_phrase_ids={
-            "可回收物": 1,   # FF 01 -> 播报语150 "可回收物"
-            "厨余垃圾": 2,   # FF 02 -> 播报语151 "厨余垃圾"
-            "有害垃圾": 3,   # FF 03 -> 播报语152 "有害垃圾"
-            "其他垃圾": 4,   # FF 04 -> 播报语153 "其他垃圾"
+            "可回收物": 1,   # 假设 ID 1 对应可回收物
+            "厨余垃圾": 2,
+            "有害垃圾": 3,
+            "其他垃圾": 4,
         },
-        post_trigger_delay=0.8,  # Optimized: 1.5→0.8s for faster photo capture
+        post_trigger_delay=0.5,
     )
     return cfg
 
