@@ -1,14 +1,15 @@
 """Voice-driven garbage classification workflow for MaixCam + WonderEcho.
 
-Updated workflow using audio monitoring instead of I2C polling:
+Updated workflow using audio monitoring + MaixCam speaker:
 1. 用户说"小幻小幻" → WonderEcho播报"我在"
 2. 用户说"开启垃圾分类" → WonderEcho播报"已开启" 
 3. **麦克风监听到"已开启"语音** → 板卡自动拍照
 4. 上传照片至垃圾分类服务器
-5. 服务器返回分类结果，调用 WonderEcho 被动播报词条 150–153 (FF 01–04)
+5. 服务器返回分类结果，**MaixCam 扬声器播放提示音**
 
-Note: I2C register 0x64 does not update with recognition results, 
-so we use audio-triggered approach instead.
+Note: 
+- I2C register 0x64 does not update with recognition results (using audio monitoring)
+- WonderEcho I2C 被动播报无法正常工作 (using MaixCam speaker for results)
 """
 from __future__ import annotations
 
@@ -129,11 +130,37 @@ class AudioResponder:
 
     def _play_wav(self, path: str) -> bool:
         if not path or not os.path.exists(path):
+            print(f"[Audio] File not found: {path}")
             return False
-        player = audio.Player(path)
-        player.volume(self.assets.volume)
-        player.play()
-        return True
+        
+        player = None
+        try:
+            print(f"[Audio] Playing: {path}")
+            player = audio.Player(path)
+            player.volume(self.assets.volume)
+            
+            # 播放并等待完成（最多循环10次）
+            max_loops = 10
+            for _ in range(max_loops):
+                if player.play() != 0:
+                    break
+                time.sleep(0.01)
+            
+            # 等待播放完成
+            time.sleep(1.0)
+            
+            print(f"[Audio] Playback finished")
+            return True
+        except Exception as e:
+            print(f"[Audio] Playback error: {e}")
+            return False
+        finally:
+            # 关键：显式释放音频资源
+            if player is not None:
+                try:
+                    del player
+                except:
+                    pass
 
     def respond(self, event_key: str, fallback_phrase_id: Optional[int] = None) -> None:
         wav_path = self.assets.events.get(event_key)
@@ -142,23 +169,85 @@ class AudioResponder:
             self.voice.speak(ASR_CMDMAND, fallback_phrase_id)
 
     def announce_category(self, category: str, fallback_phrase_id: Optional[int] = None) -> bool:
-        """Announce garbage category via WAV or WonderEcho I2C.
+        """Announce garbage category via MaixCam speaker.
         
         Returns True if announcement was sent successfully.
         """
+        # 优先使用 WAV 文件
         wav_path = self.assets.categories.get(category)
-        if wav_path and self._play_wav(wav_path):
-            return True
-        # Use WonderEcho I2C speak command
-        if fallback_phrase_id is not None and self.voice:
-            print(f"[Audio] Sending I2C speak command: 0xFF 0x{fallback_phrase_id:02X} for '{category}'")
-            success = self.voice.speak(ASR_ANNOUNCER, fallback_phrase_id)
-            if success:
-                print(f"[Audio] ✓ WonderEcho will announce: {category}")
+        if wav_path:
+            print(f"[Audio] Checking WAV for '{category}': {wav_path}")
+            if os.path.exists(wav_path):
+                print(f"[Audio] File exists, attempting playback...")
+                if self._play_wav(wav_path):
+                    print(f"[Audio] ✓ Successfully played WAV: {category}")
+                    return True
+                else:
+                    print(f"[Audio] ⚠️  WAV playback failed, using beep fallback")
             else:
-                print(f"[Audio] ✗ I2C speak command failed!")
-            return success
-        return False
+                print(f"[Audio] ⚠️  WAV file not found: {wav_path}")
+                print(f"[Audio] Using beep fallback")
+        
+        # 如果没有 WAV 文件或播放失败，生成简单提示音
+        print(f"[Audio] Generating beep for: {category}")
+        self._play_category_beep(category)
+        return True
+    
+    def _play_category_beep(self, category: str) -> None:
+        """Play a simple beep pattern to indicate category (fallback when no WAV)."""
+        # 不同类别用不同频率的提示音
+        beep_patterns = {
+            "可回收物": (800, 0.3, 2),   # 高音，短促，2次
+            "厨余垃圾": (600, 0.3, 2),   # 中高音，短促，2次
+            "有害垃圾": (400, 0.5, 1),   # 中低音，较长，1次
+            "其他垃圾": (300, 0.3, 3),   # 低音，短促，3次
+        }
+        
+        freq, duration, count = beep_patterns.get(category, (500, 0.3, 1))
+        
+        try:
+            import math
+            import struct
+            import tempfile
+            import wave
+            
+            # 生成临时 WAV 文件
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            sample_rate = 16000
+            samples = []
+            
+            # 生成指定次数的提示音
+            for _ in range(count):
+                # 提示音
+                for i in range(int(sample_rate * duration)):
+                    t = i / sample_rate
+                    value = int(32767 * 0.3 * math.sin(2 * math.pi * freq * t))
+                    samples.append(value)
+                # 间隔
+                if count > 1:
+                    for _ in range(int(sample_rate * 0.1)):
+                        samples.append(0)
+            
+            # 写入 WAV
+            with wave.open(tmp_path, 'w') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                for sample in samples:
+                    wav_file.writeframes(struct.pack('<h', sample))
+            
+            # 播放
+            self._play_wav(tmp_path)
+            
+            # 清理
+            import os
+            os.unlink(tmp_path)
+            
+        except Exception as e:
+            print(f"[Audio] Beep generation failed: {e}")
+            print(f"[Audio] Category: {category} (text only)")
 
 
 # ------------------------------ Camera + HTTP --------------------------------
@@ -328,16 +417,12 @@ class GarbageVoiceAssistant:
             fallback_id = self.cfg.category_phrase_ids.get(category)
             
             if fallback_id:
-                # Brief delay to ensure WonderEcho is ready for new command
-                print("[Assistant] Preparing to announce result...")
-                time.sleep(0.5)
+                # 使用 MaixCam 扬声器播报结果
+                print(f"[Assistant] Announcing result: {category}")
+                self.audio.announce_category(category, fallback_phrase_id=fallback_id)
                 
-                # Send I2C command to WonderEcho
-                success = self.audio.announce_category(category, fallback_phrase_id=fallback_id)
-                
-                if success:
-                    # Wait for announcement to complete before next trigger
-                    time.sleep(2.0)
+                # Wait for announcement to complete before next trigger
+                time.sleep(2.0)
             else:
                 print(f"[Assistant] ERROR: No phrase ID for category: {category}")
                 print(f"[Assistant] Available categories: {list(self.cfg.category_phrase_ids.keys())}")
@@ -348,6 +433,9 @@ class GarbageVoiceAssistant:
 # ------------------------------ Entrypoint ------------------------------------
 
 def build_default_config() -> AssistantConfig:
+    # 语音文件目录（根据实际情况修改）
+    audio_dir = "/root/garbage_audio"
+    
     audio_assets = AudioAssets(
         events={
             "wake_ack": "",
@@ -355,7 +443,12 @@ def build_default_config() -> AssistantConfig:
             "result_prefix": "",
             "network_error": "",
         },
-        categories={},
+        categories={
+            "可回收物": f"{audio_dir}/recyclable.wav",
+            "厨余垃圾": f"{audio_dir}/kitchen.wav",
+            "有害垃圾": f"{audio_dir}/hazardous.wav",
+            "其他垃圾": f"{audio_dir}/other.wav",
+        },
         volume=85,
     )
     

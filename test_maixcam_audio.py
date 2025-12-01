@@ -38,30 +38,19 @@ def test_playback():
     
     print("\n测试 MaixCam 扬声器...")
     
-    # 检查是否有可用的 WAV 文件并播放
+    # 检查是否有可用的 WAV 文件
     for category, filename in CATEGORY_FILES.items():
         filepath = os.path.join(AUDIO_DIR, filename)
         if os.path.exists(filepath):
             print(f"\n播放: {category} ({filename})")
-            player = None
             try:
-                # 创建播放器 - 使用文件路径
-                player = audio.Player(filepath)
+                player = audio.Player()
                 player.volume(85)
-                
-                # 播放音频
-                player.play()
-                
-                # 等待播放完成
-                time.sleep(1)
+                player.play(filepath)
+                time.sleep(2)
                 print("  ✓ 播放完成")
             except Exception as e:
                 print(f"  ✗ 播放失败: {e}")
-            finally:
-                # 确保释放播放器资源
-                if player:
-                    del player
-                time.sleep(0.5)  # 等待 PCM 设备释放
         else:
             print(f"\n跳过: {category} (文件不存在)")
 
