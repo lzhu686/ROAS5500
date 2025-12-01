@@ -138,16 +138,10 @@ class AudioResponder:
             print(f"[Audio] Playing: {path}")
             player = audio.Player(path)
             player.volume(self.assets.volume)
-            
-            # 播放并等待完成（最多循环10次）
-            max_loops = 10
-            for _ in range(max_loops):
-                if player.play() != 0:
-                    break
-                time.sleep(0.01)
+            player.play()
             
             # 等待播放完成
-            time.sleep(1.0)
+            time.sleep(2.0)
             
             print(f"[Audio] Playback finished")
             return True
@@ -159,6 +153,7 @@ class AudioResponder:
             if player is not None:
                 try:
                     del player
+                    time.sleep(0.2)  # 确保资源释放
                 except:
                     pass
 
@@ -173,25 +168,23 @@ class AudioResponder:
         
         Returns True if announcement was sent successfully.
         """
-        # 优先使用 WAV 文件
+        # 使用真实 WAV 文件
         wav_path = self.assets.categories.get(category)
-        if wav_path:
-            print(f"[Audio] Checking WAV for '{category}': {wav_path}")
-            if os.path.exists(wav_path):
-                print(f"[Audio] File exists, attempting playback...")
-                if self._play_wav(wav_path):
-                    print(f"[Audio] ✓ Successfully played WAV: {category}")
-                    return True
-                else:
-                    print(f"[Audio] ⚠️  WAV playback failed, using beep fallback")
-            else:
-                print(f"[Audio] ⚠️  WAV file not found: {wav_path}")
-                print(f"[Audio] Using beep fallback")
+        if not wav_path:
+            print(f"[Audio] ✗ No audio file configured for category: {category}")
+            return False
         
-        # 如果没有 WAV 文件或播放失败，生成简单提示音
-        print(f"[Audio] Generating beep for: {category}")
-        self._play_category_beep(category)
-        return True
+        if not os.path.exists(wav_path):
+            print(f"[Audio] ✗ Audio file not found: {wav_path}")
+            return False
+        
+        print(f"[Audio] Playing result for '{category}': {wav_path}")
+        if self._play_wav(wav_path):
+            print(f"[Audio] ✓ Successfully announced: {category}")
+            return True
+        else:
+            print(f"[Audio] ✗ Failed to play audio for: {category}")
+            return False
     
     def _play_category_beep(self, category: str) -> None:
         """Play a simple beep pattern to indicate category (fallback when no WAV)."""
@@ -413,19 +406,17 @@ class GarbageVoiceAssistant:
         category = self.classifier.classify(snapshot)
         
         if category:
-            print(f"[Assistant] Result: {category}")
-            fallback_id = self.cfg.category_phrase_ids.get(category)
+            print(f"[Assistant] Classification result: {category}")
             
-            if fallback_id:
-                # 使用 MaixCam 扬声器播报结果
-                print(f"[Assistant] Announcing result: {category}")
-                self.audio.announce_category(category, fallback_phrase_id=fallback_id)
-                
-                # Wait for announcement to complete before next trigger
-                time.sleep(2.0)
+            # 播放对应的真实语音文件
+            success = self.audio.announce_category(category)
+            
+            if success:
+                print(f"[Assistant] ✓ Result announced successfully")
+                # 等待音频播放完成
+                time.sleep(2.5)
             else:
-                print(f"[Assistant] ERROR: No phrase ID for category: {category}")
-                print(f"[Assistant] Available categories: {list(self.cfg.category_phrase_ids.keys())}")
+                print(f"[Assistant] ✗ Failed to announce result")
         else:
             print("[Assistant] Classification failed - server error")
 

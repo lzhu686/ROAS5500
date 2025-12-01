@@ -219,9 +219,6 @@ def main():
     
     test_audio_player_loop()
     
-    # 4. 测试录音（确认音频系统正常）
-    test_audio_recorder()
-    
     print("\n" + "=" * 60)
     print("诊断完成！")
     print("=" * 60)
