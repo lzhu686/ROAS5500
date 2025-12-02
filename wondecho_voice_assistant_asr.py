@@ -36,8 +36,8 @@ class AudioConfig:
     sample_rate: int = 16000
     # ASR model path
     asr_model_path: str = "/root/models/am_3332_192_int8.mud"
-    # Keywords to listen for (Pinyin)
-    keywords: list[str] = field(default_factory=lambda: ['kai1 qi3 la1 ji1 fen1 lei4'])
+    # Keywords to listen for (Chinese Pinyin - model only supports Chinese)
+    keywords: list[str] = field(default_factory=lambda: ['kai1 qi3'])
     # Thresholds for keywords
     thresholds: list[float] = field(default_factory=lambda: [0.3])
 
@@ -356,7 +356,7 @@ class GarbageVoiceAssistant:
         - 通过队列通信：ASR 线程检测到关键词 → 放入队列 → 主线程取出处理
         """
         print("[Assistant] 语音垃圾分类已就绪")
-        print("[Assistant] 说「开启垃圾」触发拍照")
+        print("[Assistant] 说「开启」触发拍照")
         print("[Assistant] 正在监听...\n")
         
         # 启动 ASR 监听线程
@@ -432,11 +432,11 @@ def build_default_config() -> AssistantConfig:
         volume=85,
     )
     
-    # Configure ASR - 监听"开启垃圾"
+    # Configure ASR - 监听"开启" (Chinese Pinyin - model only supports Chinese)
     audio_config = AudioConfig(
         sample_rate=16000,
         asr_model_path="/root/models/am_3332_192_int8.mud",
-        keywords=['kai1 qi3 la1 ji1'],  # 开启垃圾
+        keywords=['kai1 qi3'],  # 开启
         thresholds=[0.2],
     )
 
