@@ -9,11 +9,18 @@ Updated workflow using MaixCam ASR (Keyword Spotting):
 
 Requires:
 - /root/models/am_3332_192_int8.mud (Acoustic model for speech recognition)
+
+Architecture:
+- 使用多线程架构避免 Overrun：
+  - ASR 线程：持续运行 speech.run()，保持音频缓冲区被消费
+  - 主线程：处理拍照、上传、播报等耗时操作
 """
 from __future__ import annotations
 
 import os
 import time
+import threading
+from queue import Queue, Empty
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -220,19 +227,34 @@ class PhotoClassifier:
 # ----------------------------- Assistant logic --------------------------------
 
 class KeywordSpotter:
-    """Monitor microphone input for specific keywords using Maix ASR."""
+    """Monitor microphone input for specific keywords using Maix ASR.
+    
+    使用独立线程持续运行 speech.run()，避免 overrun。
+    检测到关键词时，将事件放入队列供主线程消费。
+    """
     
     def __init__(self, cfg: AudioConfig) -> None:
         self.cfg = cfg
+        self.speech = None
+        self.detected_keyword_index = -1
+        
+        # 事件队列：ASR 线程检测到关键词后，放入队列
+        self.event_queue: Queue[int] = Queue(maxsize=10)
+        
+        # 线程控制
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        
+        # 暂停标志：当主线程在播放音频时，暂时忽略检测结果
+        self._paused = False
+        
         if not os.path.exists(cfg.asr_model_path):
             print(f"[ASR] Error: Model file not found at {cfg.asr_model_path}")
-            print("[ASR] Please ensure the .mud model file is present.")
-            # Fallback or exit? We'll try to continue but it will fail.
+            return
         
         try:
             self.speech = nn.Speech(cfg.asr_model_path)
             self.speech.init(nn.SpeechDevice.DEVICE_MIC)
-            self.detected_keyword_index = -1
             
             # Register callback
             self.speech.kws(cfg.keywords, cfg.thresholds, self._callback, True)
@@ -243,30 +265,77 @@ class KeywordSpotter:
 
     def _callback(self, data: list[float], length: int):
         """Callback from ASR engine with probabilities."""
-        # data contains probabilities for each keyword
         for i in range(length):
-            # [调试] 打印置信度 > 0.1 的结果，方便调试麦克风和阈值
-            if data[i] > 0.1:
-                print(f"[ASR Debug] Keyword '{self.cfg.keywords[i]}' Prob: {data[i]:.3f}")
+            # 调试输出：打印所有置信度 > 0.05 的结果
+            # 这样可以看到模型是否在"听"，以及置信度是多少
+            if data[i] > 0.05:
+                kw = self.cfg.keywords[i] if i < len(self.cfg.keywords) else f"kw{i}"
+                threshold = self.cfg.thresholds[i] if i < len(self.cfg.thresholds) else 0.3
+                status = "✓ TRIGGER!" if data[i] > threshold else ""
+                print(f"[ASR] '{kw}' Prob: {data[i]:.3f} (threshold: {threshold}) {status}")
 
-            if data[i] > self.cfg.thresholds[i]:
+            # 检测到关键词且未暂停
+            if i < len(self.cfg.thresholds) and data[i] > self.cfg.thresholds[i] and not self._paused:
                 self.detected_keyword_index = i
-                # print(f"[ASR] Detected keyword {i}: {self.cfg.keywords[i]} (prob: {data[i]:.2f})")
+                # 放入队列，不阻塞（如果队列满了就丢弃）
+                try:
+                    self.event_queue.put_nowait(i)
+                except:
+                    pass  # 队列满了，丢弃这个事件
 
-    def check(self) -> int:
-        """Run ASR step and return index of detected keyword, or -1 if none."""
-        if not self.speech:
+    def _asr_thread_loop(self):
+        """ASR 线程主循环：持续调用 speech.run() 消费音频数据。"""
+        print("[ASR Thread] Started")
+        while self._running and not app.need_exit():
+            if self.speech:
+                try:
+                    # 持续运行，保持缓冲区被消费
+                    frames = self.speech.run(1)
+                    if frames < 0:
+                        print("[ASR Thread] Error in speech.run()")
+                        time.sleep(0.1)
+                except Exception as e:
+                    print(f"[ASR Thread] Exception: {e}")
+                    time.sleep(0.1)
+            else:
+                time.sleep(0.1)
+        print("[ASR Thread] Stopped")
+
+    def start(self):
+        """启动 ASR 监听线程。"""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._asr_thread_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """停止 ASR 监听线程。"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def pause(self):
+        """暂停检测（但继续消费音频数据，避免 overrun）。"""
+        self._paused = True
+        # 清空队列中积压的事件
+        while not self.event_queue.empty():
+            try:
+                self.event_queue.get_nowait()
+            except Empty:
+                break
+
+    def resume(self):
+        """恢复检测。"""
+        self._paused = False
+
+    def get_event(self, timeout: float = 0.1) -> int:
+        """从队列获取检测事件，返回关键词索引或 -1。"""
+        try:
+            return self.event_queue.get(timeout=timeout)
+        except Empty:
             return -1
-            
-        self.detected_keyword_index = -1
-        # Run one frame of processing
-        frames = self.speech.run(1)
-        
-        if frames < 0:
-            print("[ASR] Error running speech processing")
-            return -1
-            
-        return self.detected_keyword_index
 
 
 class GarbageVoiceAssistant:
@@ -275,48 +344,60 @@ class GarbageVoiceAssistant:
         self.voice_module = ASRModule(cfg.module_address, cfg.bus_id)
         self.audio = AudioResponder(cfg.audio_assets, self.voice_module)
         self.classifier = PhotoClassifier(cfg.camera, cfg.server)
-        # Use KeywordSpotter instead of AudioMonitor
+        # Use KeywordSpotter with threading
         self.kws = KeywordSpotter(cfg.audio_config)
 
     def run(self) -> None:
-        """Main loop: voice-triggered garbage classification."""
-        print("[Assistant] Voice-activated garbage classification ready (ASR Mode)")
-        print(f"[Assistant] Say: {self.cfg.audio_config.keywords[0]} (开启垃圾分类)")
-        print("[Assistant] Listening for keywords...\n")
+        """Main loop: voice-triggered garbage classification.
+        
+        架构说明：
+        - ASR 线程：持续运行 speech.run()，保持音频缓冲区被消费（避免 overrun）
+        - 主线程：处理拍照、上传、播报等耗时操作
+        - 通过队列通信：ASR 线程检测到关键词 → 放入队列 → 主线程取出处理
+        """
+        print("[Assistant] 语音垃圾分类已就绪")
+        print("[Assistant] 说「开启垃圾」触发拍照")
+        print("[Assistant] 正在监听...\n")
+        
+        # 启动 ASR 监听线程
+        self.kws.start()
         
         last_trigger_time = 0
         min_trigger_interval = 3.0
         
-        while not app.need_exit():
-            # Check for keyword
-            keyword_idx = self.kws.check()
-            
-            if keyword_idx >= 0:
-                current_time = time.time()
-                keyword = self.cfg.audio_config.keywords[keyword_idx]
+        try:
+            while not app.need_exit():
+                # 从队列获取检测事件（非阻塞，超时 0.1 秒）
+                keyword_idx = self.kws.get_event(timeout=0.1)
                 
-                # Debounce
-                if current_time - last_trigger_time < min_trigger_interval:
-                    continue
-                
-                print(f"[Assistant] Keyword detected: '{keyword}'! Capturing...")
-                
-                # Capture photo immediately
-                snapshot = self.classifier.capture_to_file()
-                print(f"[Assistant] Photo captured: {snapshot}")
-                
-                # Upload to server and get result
-                self._handle_classification(snapshot)
-                
-                last_trigger_time = time.time()
-            
-            # Small sleep to prevent CPU hogging, but not too long to miss audio frames?
-            # nn.Speech.run() might need to be called frequently.
-            # If run(1) processes a small chunk, we shouldn't sleep too much.
-            # But run(1) might block until enough data is available? 
-            # The example loop doesn't sleep.
-            # time.sleep(0.01) 
-            pass
+                if keyword_idx >= 0:
+                    current_time = time.time()
+                    keyword = self.cfg.audio_config.keywords[keyword_idx]
+                    
+                    # Debounce
+                    if current_time - last_trigger_time < min_trigger_interval:
+                        continue
+                    
+                    print(f"[Assistant] Keyword detected: '{keyword}'! Capturing...")
+                    
+                    # 暂停 ASR 检测（但线程继续运行，消费音频数据）
+                    self.kws.pause()
+                    
+                    # Capture photo
+                    snapshot = self.classifier.capture_to_file()
+                    print(f"[Assistant] Photo captured: {snapshot}")
+                    
+                    # Upload to server and announce result
+                    self._handle_classification(snapshot)
+                    
+                    last_trigger_time = time.time()
+                    
+                    # 恢复 ASR 检测
+                    self.kws.resume()
+                    print("[Assistant] Listening for keywords...\n")
+        finally:
+            # 确保线程被正确停止
+            self.kws.stop()
     
     def _handle_classification(self, snapshot: str) -> None:
         """Upload snapshot to server and announce result."""
@@ -328,7 +409,7 @@ class GarbageVoiceAssistant:
             success = self.audio.announce_category(category)
             if success:
                 print(f"[Assistant] ✓ Result announced successfully")
-                time.sleep(1.5)
+                time.sleep(0.5)  # 短暂等待，让用户听清结果
             else:
                 print(f"[Assistant] ✗ Failed to announce result")
         else:
@@ -351,12 +432,12 @@ def build_default_config() -> AssistantConfig:
         volume=85,
     )
     
-    # Configure ASR for "开启垃圾分类"
+    # Configure ASR - 监听"开启垃圾"
     audio_config = AudioConfig(
         sample_rate=16000,
         asr_model_path="/root/models/am_3332_192_int8.mud",
-        keywords=['kai1 qi3 la1 ji1 fen1 lei4'], # 开启垃圾分类
-        thresholds=[0.3],
+        keywords=['kai1 qi3 la1 ji1'],  # 开启垃圾
+        thresholds=[0.2],
     )
 
     cfg = AssistantConfig(
