@@ -17,6 +17,7 @@ Architecture:
 """
 from __future__ import annotations
 
+import io
 import os
 import time
 import threading
@@ -25,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import smbus  # type: ignore
 from maix import app, audio, camera, nn
 import numpy as np
@@ -198,6 +201,22 @@ class PhotoClassifier:
         self.server_cfg = server_cfg
         self.cam = camera.Camera(cam_cfg.width, cam_cfg.height)
         _ = self.cam.read()
+        
+        # 创建 HTTP Session 复用连接（大幅提升上传速度）
+        self.session = requests.Session()
+        # 配置重试策略
+        retry_strategy = Retry(
+            total=2,
+            backoff_factor=0.1,
+            status_forcelist=[500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=1,
+            pool_maxsize=1,
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def capture_to_file(self) -> str:
         img = self.cam.read()
@@ -206,10 +225,17 @@ class PhotoClassifier:
         img.save(snapshot_path)
         return snapshot_path
 
+    def capture_to_buffer(self) -> bytes:
+        """Capture image directly to memory buffer (faster than file I/O)."""
+        img = self.cam.read()
+        # 先转换为 JPEG，再转换为 bytes
+        jpeg_img = img.to_jpeg(quality=85)
+        return jpeg_img.to_bytes()
+
     def classify(self, image_path: str) -> Optional[str]:
         with open(image_path, "rb") as stream:
             try:
-                response = requests.post(
+                response = self.session.post(
                     self.server_cfg.url,
                     files={"file": stream},
                     timeout=self.server_cfg.timeout,
@@ -222,6 +248,25 @@ class PhotoClassifier:
             except requests.RequestException as err:
                 print(f"[Server] Request failed: {err}")
                 return None
+
+    def classify_buffer(self, image_data: bytes) -> Optional[str]:
+        """Upload image from memory buffer (faster than file upload)."""
+        try:
+            # 直接从内存上传，避免文件 I/O
+            files = {"file": ("snapshot.jpg", io.BytesIO(image_data), "image/jpeg")}
+            response = self.session.post(
+                self.server_cfg.url,
+                files=files,
+                timeout=self.server_cfg.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            category = payload.get("category")
+            print(f"[Server] Category: {category}")
+            return category
+        except requests.RequestException as err:
+            print(f"[Server] Request failed: {err}")
+            return None
 
 
 # ----------------------------- Assistant logic --------------------------------
@@ -383,12 +428,13 @@ class GarbageVoiceAssistant:
                     # 暂停 ASR 检测（但线程继续运行，消费音频数据）
                     self.kws.pause()
                     
-                    # Capture photo
-                    snapshot = self.classifier.capture_to_file()
-                    print(f"[Assistant] Photo captured: {snapshot}")
+                    # 直接拍照到内存缓冲区（更快，避免文件 I/O）
+                    t0 = time.time()
+                    image_data = self.classifier.capture_to_buffer()
+                    print(f"[Assistant] Photo captured ({len(image_data)} bytes) in {time.time()-t0:.3f}s")
                     
                     # Upload to server and announce result
-                    self._handle_classification(snapshot)
+                    self._handle_classification_fast(image_data)
                     
                     last_trigger_time = time.time()
                     
@@ -409,7 +455,24 @@ class GarbageVoiceAssistant:
             success = self.audio.announce_category(category)
             if success:
                 print(f"[Assistant] ✓ Result announced successfully")
-                time.sleep(0.5)  # 短暂等待，让用户听清结果
+            else:
+                print(f"[Assistant] ✗ Failed to announce result")
+        else:
+            print("[Assistant] Classification failed - server error")
+
+    def _handle_classification_fast(self, image_data: bytes) -> None:
+        """Upload image from memory buffer (faster)."""
+        print("[Assistant] Uploading to server...")
+        t0 = time.time()
+        category = self.classifier.classify_buffer(image_data)
+        upload_time = time.time() - t0
+        print(f"[Assistant] Upload completed in {upload_time:.3f}s")
+        
+        if category:
+            print(f"[Assistant] Classification result: {category}")
+            success = self.audio.announce_category(category)
+            if success:
+                print(f"[Assistant] ✓ Result announced successfully")
             else:
                 print(f"[Assistant] ✗ Failed to announce result")
         else:
